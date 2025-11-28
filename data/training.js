@@ -102,5 +102,21 @@ module.exports = [
   {
     "text": "buya la wena",
     "label": "non-sepitori"
+  },
+  {
+    "text": "hamba uyekhaya",
+    "label": "non-sepitori"
+  },
+  {
+    "text": "lets go to work today",
+    "label": "non-sepitori"
+  },
+  {
+    "text": "but I am late for school",
+    "label": "non-sepitori"
+  },
+  {
+    "text": "We have an assignment",
+    "label": "non-sepitori"
   }
 ];

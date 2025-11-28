@@ -57,7 +57,7 @@ app.post("/predict", (req, res) => {
   const sepitoriWords = filteredWords.filter((w) => featureSet.has(w));
   const nonSepitoriWords = filteredWords.filter((w) => !featureSet.has(w));
 
-  // Classifier probabilities (optional reference)
+  // Classifier probabilities
   const probs = classifier.getClassifications(normalized);
   const sepProb = probs.find((p) => p.label === "sepitori")?.value || 0;
   const nonProb = probs.find((p) => p.label === "non-sepitori")?.value || 0;
@@ -66,18 +66,20 @@ app.post("/predict", (req, res) => {
   const nonConfidence = nonProb / total;
 
   // ===== FINAL LABEL LOGIC =====
-  let finalLabel = "not recognized";
+  let finalLabel;
 
   if (filteredWords.length === 0) {
     finalLabel = "not recognized";          // nothing meaningful
+  } else if (unseenWords.length === filteredWords.length) {
+    finalLabel = "not recognized";          // all words unknown
+  } else if (sepitoriConfidence >= 0.65) {
+    finalLabel = "sepitori";                // high sepitori confidence
+  } else if (nonConfidence >= 0.65) {
+    finalLabel = "non-sepitori";            // high non-sepitori confidence
   } else if (sepitoriWords.length > 0 && nonSepitoriWords.length > 0) {
-    finalLabel = "mixed";                   // contains both classes
-  } else if (sepitoriWords.length > 0) {
-    finalLabel = "sepitori";                // only sepitori
-  } else if (nonSepitoriWords.length > 0) {
-    finalLabel = "non-sepitori";            // only non-sepitori
+    finalLabel = "mixed";                   // mix of known words
   } else {
-    finalLabel = "not recognized";          // fallback
+    finalLabel = sepitoriConfidence > nonConfidence ? "sepitori" : "non-sepitori"; // fallback
   }
 
   res.json({
@@ -155,5 +157,5 @@ app.get("/debug-features", (req, res) => {
 
 // ===== SERVER START =====
 app.listen(5000, () => {
-  console.log("🚀 API runnings on http://localhost:5000");
+  console.log("🚀 API running on http://localhost:5000");
 });
