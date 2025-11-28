@@ -9,11 +9,20 @@ app.use(express.json());
 app.use(cors());
 
 let classifier;
+const stemmer = natural.PorterStemmer;
 
-// Normalize text
+// Normalize text: lowercase + remove punctuation
 const normalize = (text) => text.toLowerCase().replace(/[^\w\s]/g, "");
 
-// Load trained classifier
+// Stem words
+const stemWords = (words) => words.map((w) => stemmer.stem(w));
+
+// Stopwords to ignore in matching
+const STOPWORDS = new Set([
+  "we","have","an","the","is","are","am","i","you","he","she","it","they",
+]);
+
+// ===== LOAD CLASSIFIER ON START =====
 natural.BayesClassifier.load("sepitoriClassifier.json", null, (err, loaded) => {
   if (err) console.error("❌ Failed to load model:", err);
   else {
@@ -22,59 +31,55 @@ natural.BayesClassifier.load("sepitoriClassifier.json", null, (err, loaded) => {
   }
 });
 
-// ===== PREDICTION ROUTE =====
+// =====================
+//     PREDICT ROUTE
+// =====================
 app.post("/predict", (req, res) => {
-  if (!classifier)
-    return res.status(503).json({ error: "Model not loaded yet" });
+  if (!classifier) return res.status(503).json({ error: "Model not loaded yet" });
 
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "Text is required" });
 
-  const lower = normalize(text);
-  const words = lower.split(/\s+/);
+  const normalized = normalize(text);
+  const rawWords = normalized.split(/\s+/).filter(Boolean);
+  const stemmedWords = stemWords(rawWords);
 
-  // ----- Get model words safely -----
-  let modelWords = [];
-  if (classifier.wordFrequencyCount) {
-    modelWords = Object.keys(classifier.wordFrequencyCount);
-  } else if (classifier.features) {
-    modelWords = Object.keys(classifier.features);
-  }
+  // Remove stopwords
+  const filteredWords = stemmedWords.filter((w) => !STOPWORDS.has(w));
 
-  // ----- Detect unseen words -----
-  const unseenWords = words.filter(w => !modelWords.includes(w));
+  // Model features (stemmed)
+  const featureSet = new Set(Object.keys(classifier.features || {}));
 
-  // Classifier probabilities
-  const probs = classifier.getClassifications(lower);
-  const sepProb = probs.find(p => p.label === "sepitori")?.value || 0;
-  const nonProb = probs.find(p => p.label === "non-sepitori")?.value || 0;
+  // Detect unseen words
+  const unseenWords = filteredWords.filter((w) => !featureSet.has(w));
 
-  // Normalize confidence
+  // Separate known vs unknown words
+  const sepitoriWords = filteredWords.filter((w) => featureSet.has(w));
+  const nonSepitoriWords = filteredWords.filter((w) => !featureSet.has(w));
+
+  // Classifier probabilities (optional reference)
+  const probs = classifier.getClassifications(normalized);
+  const sepProb = probs.find((p) => p.label === "sepitori")?.value || 0;
+  const nonProb = probs.find((p) => p.label === "non-sepitori")?.value || 0;
   const total = sepProb + nonProb || 1;
   const sepitoriConfidence = sepProb / total;
   const nonConfidence = nonProb / total;
 
-  // ----- FINAL LABEL LOGIC -----
+  // ===== FINAL LABEL LOGIC =====
   let finalLabel = "not recognized";
 
-  if (words.length > 0 && unseenWords.length === words.length) {
-    // All words are unseen
-    finalLabel = "not recognized";
-  } else if (sepitoriConfidence >= 0.65 && sepProb > 0) {
-    finalLabel = "sepitori";
-    if (words.length > 1 && unseenWords.length / words.length > 0.5) {
-      finalLabel = "mixed";
-    }
-  } else if (nonConfidence >= 0.65 && nonProb > 0) {
-    finalLabel = "non-sepitori";
-    if (words.length > 1 && unseenWords.length / words.length > 0.5) {
-      finalLabel = "mixed";
-    }
+  if (filteredWords.length === 0) {
+    finalLabel = "not recognized";          // nothing meaningful
+  } else if (sepitoriWords.length > 0 && nonSepitoriWords.length > 0) {
+    finalLabel = "mixed";                   // contains both classes
+  } else if (sepitoriWords.length > 0) {
+    finalLabel = "sepitori";                // only sepitori
+  } else if (nonSepitoriWords.length > 0) {
+    finalLabel = "non-sepitori";            // only non-sepitori
   } else {
-    finalLabel = "mixed";
+    finalLabel = "not recognized";          // fallback
   }
 
-  // Send response
   res.json({
     text,
     finalLabel,
@@ -88,41 +93,67 @@ app.post("/predict", (req, res) => {
   });
 });
 
-// ===== TRAINING ROUTE =====
+// =====================
+//      TRAIN ROUTE
+// =====================
 app.post("/train", (req, res) => {
   if (!classifier) return res.status(503).json({ error: "Model not loaded yet" });
 
   const { text, label } = req.body;
-  if (!text || !label) return res.status(400).json({ error: "Text and label are required" });
+  if (!text || !label)
+    return res.status(400).json({ error: "Text and label are required" });
 
-  const normalizedText = normalize(text);
+  const normalized = normalize(text);
 
-  // 1. Add to classifier
-  classifier.addDocument(normalizedText, label);
+  // Add to classifier & train
+  classifier.addDocument(normalized, label);
   classifier.train();
+
   classifier.save("sepitoriClassifier.json", (err) => {
-    if (err) console.error("❌ Error saving classifier:", err);
+    if (err) {
+      console.error("❌ Error saving classifier:", err);
+      return res.json({ success: false });
+    }
+
+    // Reload classifier
+    natural.BayesClassifier.load("sepitoriClassifier.json", null, (err, loaded) => {
+      if (!err) {
+        classifier = loaded;
+        console.log("♻️ Classifier reloaded after training!");
+      }
+    });
+
+    // Update training.js
+    const trainingFile = path.join(__dirname, "data", "training.js");
+    delete require.cache[require.resolve(trainingFile)];
+    let currentData = require(trainingFile);
+
+    currentData.push({ text, label });
+
+    const fileContent =
+      "module.exports = " + JSON.stringify(currentData, null, 2) + ";";
+    fs.writeFileSync(trainingFile, fileContent, "utf-8");
+
+    res.json({
+      success: true,
+      message: "New sentence added, model retrained, and reloaded!",
+    });
   });
+});
 
-  // 2. Append to training.js
-  const trainingFile = path.join(__dirname, "data", "training.js");
+// =====================
+// DEBUG - See model features
+// =====================
+app.get("/debug-features", (req, res) => {
+  if (!classifier) return res.status(503).json({ error: "Model not loaded" });
 
-  // Read current training data
-  delete require.cache[require.resolve(trainingFile)]; // Clear cache
-  let currentData = require(trainingFile);
-
-  // Add new entry
-  currentData.push({ text, label });
-
-  // Convert to JS module format
-  const fileContent = "module.exports = " + JSON.stringify(currentData, null, 2) + ";";
-
-  fs.writeFileSync(trainingFile, fileContent, "utf-8");
-
-  res.json({ success: true, message: "New sentence added and model updated!" });
+  res.json({
+    totalFeatures: Object.keys(classifier.features || {}).length,
+    featureKeys: Object.keys(classifier.features || {}).slice(0, 200),
+  });
 });
 
 // ===== SERVER START =====
 app.listen(5000, () => {
-  console.log("🚀 API running on http://localhost:5000");
+  console.log("🚀 API runnings on http://localhost:5000");
 });
